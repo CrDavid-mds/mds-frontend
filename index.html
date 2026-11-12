@@ -904,7 +904,7 @@ function openChat(id, forceChat){
       div.className = 'msg ' + (isOut ? 'out' : 'in');
       div.dataset.msgId = m.id;
       
-      const time = m.time ? new Date(m.time).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}) : '';
+      const time = formatMsgTime(m.time);
       let fromName = '';
       if(!isOut && m.from !== 'system' && chat.type !== 'private'){ 
         const u = usersCache.find(x => x.username === m.from); 
@@ -949,7 +949,7 @@ function openChat(id, forceChat){
       } else if (m.type === 'circle' && m.video) {
         const dur = m.duration || 1;
         bodyHtml = `<div class="circle-msg" data-has-circle="1" onclick="event.stopPropagation();playCircle(this)">
-          <video preload="auto" playsinline webkit-playsinline muted></video>
+          <video preload="auto" playsinline webkit-playsinline muted x-webkit-airplay="allow"></video>
           <div class="circle-play-icon"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></div>
           <span class="circle-dur">${formatRecTime(dur)}</span>
         </div>`;
@@ -967,23 +967,41 @@ function openChat(id, forceChat){
         if (v) {
           v.dataset.srcData = m.video;
           v.playsInline = true;
+          v.muted = true; // для автозагрузки превью
           v.setAttribute('playsinline', '');
           v.setAttribute('webkit-playsinline', '');
+          v.setAttribute('preload', 'auto');
+          v.setAttribute('muted', '');
+          // Не ставим src сразу на огромный data: — сначала blob
           try {
             const blobUrl = dataUrlToBlobUrl(m.video);
             if (blobUrl) {
+              if (v.dataset.oldBlob) {
+                try { URL.revokeObjectURL(v.dataset.oldBlob); } catch(e){}
+              }
               v.dataset.oldBlob = blobUrl;
               v.src = blobUrl;
               v.dataset.blobbed = '1';
               v.load();
-            } else {
+            } else if (m.video.length < 900000) {
+              // Fallback только если не слишком большой
               v.src = m.video;
+              v.dataset.blobbed = '0';
               v.load();
+            } else {
+              // Слишком большой — показываем заглушку
+              const parent = v.closest('.circle-msg');
+              if (parent) {
+                parent.innerHTML = '<div style="padding:12px;color:var(--text2);font-size:13px;text-align:center;">⭕ Кружок слишком большой</div>';
+              }
             }
           } catch (e) {
+            console.error('circle init', e);
             try {
-              v.src = m.video;
-              v.load();
+              if (m.video.length < 900000) {
+                v.src = m.video;
+                v.load();
+              }
             } catch (e2) {}
           }
         }
@@ -1085,6 +1103,23 @@ function formatRecTime(sec) {
   const m = Math.floor(sec / 60);
   const s = Math.floor(sec % 60);
   return m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+function formatMsgTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return '';
+  const now = new Date();
+  const sameDay = d.getFullYear() === now.getFullYear() &&
+                  d.getMonth() === now.getMonth() &&
+                  d.getDate() === now.getDate();
+  const timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  if (sameDay) return timeStr;
+  const sameYear = d.getFullYear() === now.getFullYear();
+  const dateStr = d.toLocaleDateString([], sameYear
+    ? { day: '2-digit', month: '2-digit' }
+    : { day: '2-digit', month: '2-digit', year: '2-digit' });
+  return dateStr + ' ' + timeStr;
 }
 
 async function toggleRecording() {
@@ -1413,12 +1448,22 @@ function sendCircleMsg(dataUrl, duration, mimeType) {
 
 function dataUrlToBlobUrl(dataUrl) {
   try {
-    if (!dataUrl || typeof dataUrl !== 'string') return null;
-    const parts = dataUrl.split(',');
-    if (parts.length < 2) return null;
-    const mimeMatch = parts[0].match(/:(.*?);/);
-    const mime = (mimeMatch && mimeMatch[1]) || 'video/webm';
-    const bin = atob(parts[1]);
+    if (!dataUrl || typeof dataUrl !== 'string' || !dataUrl.startsWith('data:')) return null;
+    // Защита от слишком больших строк (atob + Uint8Array ест много памяти)
+    if (dataUrl.length > 1400000) {
+      console.warn('dataUrlToBlobUrl: too large', dataUrl.length);
+      return null;
+    }
+    const comma = dataUrl.indexOf(',');
+    if (comma < 0) return null;
+    const header = dataUrl.slice(0, comma);
+    const b64 = dataUrl.slice(comma + 1);
+    const mimeMatch = header.match(/:(.*?);/);
+    let mime = (mimeMatch && mimeMatch[1]) || 'video/webm';
+    // Нормализуем mime для лучшей совместимости
+    if (mime.includes('webm')) mime = 'video/webm';
+    else if (mime.includes('mp4') || mime.includes('avc')) mime = 'video/mp4';
+    const bin = atob(b64);
     const len = bin.length;
     const bytes = new Uint8Array(len);
     for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
@@ -1431,7 +1476,7 @@ function dataUrlToBlobUrl(dataUrl) {
 
 function ensureCircleVideoSrc(video) {
   if (!video) return Promise.resolve(false);
-  if (video.dataset.blobbed === '1' && video.src && video.src.indexOf('blob:') === 0) {
+  if (video.dataset.blobbed === '1' && video.src && video.src.indexOf('blob:') === 0 && !video.error) {
     return Promise.resolve(true);
   }
   const raw = video.dataset.srcData || (video.src && video.src.indexOf('data:') === 0 ? video.src : null);
@@ -1440,23 +1485,31 @@ function ensureCircleVideoSrc(video) {
   return new Promise((resolve) => {
     try {
       const blobUrl = dataUrlToBlobUrl(raw);
-      if (!blobUrl) {
-        if (!video.src || video.src.indexOf('data:') !== 0) video.src = raw;
+      if (blobUrl) {
+        if (video.dataset.oldBlob) {
+          try { URL.revokeObjectURL(video.dataset.oldBlob); } catch(e){}
+        }
+        video.dataset.oldBlob = blobUrl;
+        video.src = blobUrl;
+        video.dataset.blobbed = '1';
         try { video.load(); } catch(e){}
         resolve(true);
         return;
       }
-      if (video.dataset.oldBlob) {
-        try { URL.revokeObjectURL(video.dataset.oldBlob); } catch(e){}
-      }
-      video.dataset.oldBlob = blobUrl;
-      video.src = blobUrl;
-      video.dataset.blobbed = '1';
+      // Fallback на data URL (может не сработать на очень больших или iOS)
+      video.src = raw;
+      video.dataset.blobbed = '0';
       try { video.load(); } catch(e){}
       resolve(true);
     } catch (e) {
       console.error('ensureCircleVideoSrc', e);
-      resolve(false);
+      try {
+        video.src = raw;
+        video.load();
+        resolve(true);
+      } catch (e2) {
+        resolve(false);
+      }
     }
   });
 }
@@ -1483,26 +1536,57 @@ function playCircle(wrap) {
   wrap.classList.add('playing');
   video.setAttribute('playsinline', '');
   video.setAttribute('webkit-playsinline', '');
+  video.setAttribute('x-webkit-airplay', 'allow');
   video.playsInline = true;
   video.loop = false;
+  video.controls = false;
 
   const doPlay = (allowMuted) => {
-    video.muted = !!allowMuted;
-    const p = video.play();
-    if (p && typeof p.then === 'function') {
-      p.then(() => {}).catch((err) => {
-        console.warn('circle play error', err);
-        if (!allowMuted) {
-          doPlay(true);
-        } else {
-          wrap.classList.remove('playing');
-          showToast('Не удалось воспроизвести кружок', 'error');
-        }
-      });
+    try {
+      video.muted = !!allowMuted;
+      const p = video.play();
+      if (p && typeof p.then === 'function') {
+        p.then(() => {
+          // Успех — если играли с muted, пробуем включить звук (если браузер позволит)
+          if (allowMuted && video.muted) {
+            // оставляем muted, чтобы не падало
+          }
+        }).catch((err) => {
+          console.warn('circle play error', err && err.name, err);
+          if (!allowMuted) {
+            doPlay(true);
+          } else {
+            wrap.classList.remove('playing');
+            showToast('Не удалось воспроизвести кружок', 'error');
+          }
+        });
+      }
+    } catch (e) {
+      console.warn('circle play throw', e);
+      if (!allowMuted) doPlay(true);
+      else {
+        wrap.classList.remove('playing');
+        showToast('Не удалось воспроизвести кружок', 'error');
+      }
     }
   };
 
   const startPlayback = () => {
+    if (video.error) {
+      // Попробуем пересоздать src
+      video.dataset.blobbed = '0';
+      ensureCircleVideoSrc(video).then(() => {
+        if (video.readyState >= 2) doPlay(false);
+        else {
+          video.addEventListener('canplay', function onC() {
+            video.removeEventListener('canplay', onC);
+            doPlay(false);
+          }, { once: true });
+          setTimeout(() => { if (video.paused) doPlay(false); }, 800);
+        }
+      });
+      return;
+    }
     if (video.readyState >= 2) {
       doPlay(false);
     } else {
@@ -1513,11 +1597,12 @@ function playCircle(wrap) {
       };
       video.addEventListener('canplay', onReady);
       video.addEventListener('loadeddata', onReady);
+      // На всякий случай пробуем через таймаут
       setTimeout(() => {
         video.removeEventListener('canplay', onReady);
         video.removeEventListener('loadeddata', onReady);
         if (video.paused) doPlay(false);
-      }, 900);
+      }, 1200);
     }
   };
 
@@ -1527,9 +1612,22 @@ function playCircle(wrap) {
   };
 
   video.onerror = () => {
-    wrap.classList.remove('playing');
-    console.error('circle video error', video.error);
-    showToast('Ошибка воспроизведения кружка', 'error');
+    console.error('circle video error', video.error && video.error.code, video.error);
+    // Одна попытка пересоздать blob/src
+    if (!video.dataset.retried) {
+      video.dataset.retried = '1';
+      video.dataset.blobbed = '0';
+      ensureCircleVideoSrc(video).then((ok) => {
+        if (ok) startPlayback();
+        else {
+          wrap.classList.remove('playing');
+          showToast('Ошибка воспроизведения кружка', 'error');
+        }
+      });
+    } else {
+      wrap.classList.remove('playing');
+      showToast('Ошибка воспроизведения кружка', 'error');
+    }
   };
 
   ensureCircleVideoSrc(video).then((ok) => {
